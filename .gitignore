@@ -1,0 +1,26 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+*.spec
+
+# Data / output files
+Data/
+*.csv
+*.pos
+*.h5
+*.hdf5
+
+# Config snapshots (user-local)
+sample_station_config.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
