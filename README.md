@@ -168,5 +168,5 @@ Column aliases for CSV import (e.g. `s_x`, `sx`, `sp_x`, `sample_x`, `motor_x` a
 
 ## Author
 
-Jia-Jung Tian — Advanced Photon Source, Argonne National Laboratory  
+Jiajun Tian — ChemMatCARS, University of Chicago  
 Contact: jiajtian@uchicago.edu
