@@ -1,6 +1,6 @@
 # ASWAXS_Collector
 
-**ASWAXS_Collector** is the beamline data-collection front-end for the ASWAXS (Anomalous Small- and Wide-Angle X-ray Scattering) instrument at Sector 15-ID-D, Advanced Photon Source (APS), Argonne National Laboratory.
+**ASWAXS_Collector** is the beamline data-collection front-end for the ASWAXS (Anomalous Small- and Wide-Angle X-ray Scattering) instrument at the Advanced Photon Source (APS), Argonne National Laboratory.
 
 It is part of a three-component software stack:
 
@@ -113,20 +113,20 @@ Settings are stored in `sample_station_config.json` (auto-created on first run):
 
 ```json
 {
-    "X_MOTOR_PV":       "15IDD:m19",
-    "Y_MOTOR_PV":       "15IDD:m18",
-    "Z_MOTOR_PV":       "15IDD:m7",
-    "CAMERA_PREFIX":    "Teslong:cam1:",
-    "IMAGE_PREFIX":     "Teslong:image1:",
+    "X_MOTOR_PV":       "PREFIX:mXX",
+    "Y_MOTOR_PV":       "PREFIX:mXX",
+    "Z_MOTOR_PV":       "PREFIX:mXX",
+    "CAMERA_PREFIX":    "CAMERA:cam1:",
+    "IMAGE_PREFIX":     "CAMERA:image1:",
     "AUTOFOCUS_STEP":   "0.2",
     "AUTOFOCUS_SCRIPT": "autofocus.py",
-    "BLENDER_HOST":     "164.54.169.92",
-    "BLENDER_USER":     "chem_epics",
-    "BLENDER_KEY":      "/home/chem_epics/.ssh/mykey",
+    "BLENDER_HOST":     "your.remote.host",
+    "BLENDER_USER":     "username",
+    "BLENDER_KEY":      "/home/username/.ssh/id_rsa",
     "BLENDER_EXE":      "blender",
     "BLENDER_SCRIPT":   "/path/to/Blender_Macro.py",
-    "LOCAL_MOUNT":      "/home/chem_epics/cars6/Data",
-    "REMOTE_MOUNT":     "/home/chem_epics/cars6/Data"
+    "LOCAL_MOUNT":      "/local/data/mount",
+    "REMOTE_MOUNT":     "/remote/data/mount"
 }
 ```
 
