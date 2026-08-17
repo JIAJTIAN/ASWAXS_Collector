@@ -354,10 +354,14 @@ def export_reducer_pairs_csv(path, positions: list) -> None:
 # ── Thread-safe EPICS → Qt bridge ─────────────────────────────────────────────
 
 class _PVBridge(QObject):
-    changed = pyqtSignal(str, object)
+    changed    = pyqtSignal(str, object)
+    conn_state = pyqtSignal(str, bool)   # pvname, connected
 
     def __call__(self, pvname=None, value=None, **_kw):
         self.changed.emit(str(pvname or ""), value)
+
+    def conn_cb(self, pvname=None, conn=True, **_kw):
+        self.conn_state.emit(str(pvname or ""), bool(conn))
 
 
 # ── Single-motor control panel ─────────────────────────────────────────────────
@@ -373,14 +377,16 @@ class MotorPanel(QObject):
         self._motor = None
         self._bridge = _PVBridge()
         self._bridge.changed.connect(self._on_pv)
+        self._bridge.conn_state.connect(self._on_conn)
         self._build_widgets()
 
     def _build_widgets(self):
-        # Axis badge (X / Y / Z)
+        # Axis badge — doubles as PV connection indicator
         self.axis_lbl = QLabel(self._label[0])
         self.axis_lbl.setFixedWidth(28)
         self.axis_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.axis_lbl.setObjectName("axisLabel")
+        self._set_conn("idle")
 
         # DESC readback
         self.desc_lbl = QLabel("—")
@@ -453,17 +459,23 @@ class MotorPanel(QObject):
         self._disconnect()
         self._base = base_pv
         if not (EPICS_AVAILABLE and base_pv):
+            self._set_conn("idle")
             return
+        self._set_conn("connecting")
         try:
             monitored   = ("DESC", "RBV", "VAL", "MOVN", "TWV")
             unmonitored = ("TWR", "TWF")
             for f in monitored:
-                self._pvs[f] = PV(f"{base_pv}.{f}", callback=self._bridge, auto_monitor=True)
+                kw = dict(callback=self._bridge, auto_monitor=True)
+                if f == "RBV":
+                    kw["connection_callback"] = self._bridge.conn_cb
+                self._pvs[f] = PV(f"{base_pv}.{f}", **kw)
             for f in unmonitored:
                 self._pvs[f] = PV(f"{base_pv}.{f}")
             self._motor = Motor(base_pv)
         except Exception as e:
             print(f"Motor({base_pv}) connection failed: {e}")
+            self._set_conn("lost")
 
     def get_rbv(self) -> float:
         try:
@@ -500,6 +512,7 @@ class MotorPanel(QObject):
                 pass
         self._pvs.clear()
         self._motor = None
+        self._set_conn("idle")
 
     @pyqtSlot(str, object)
     def _on_pv(self, pvname: str, value):
@@ -519,6 +532,36 @@ class MotorPanel(QObject):
         elif pvname == f"{b}.TWV":
             if not self.step_edit.hasFocus():
                 self.step_edit.setText(f"{float(value):.3f}")
+
+    _CONN_STYLE = {
+        "idle":       "background:#9ca3af; color:white;",
+        "connecting": "background:#d97706; color:white;",
+        "ok":         "background:#16a34a; color:white;",
+        "lost":       "background:#dc2626; color:white;",
+    }
+    _CONN_TIP = {
+        "idle":       "No PV configured",
+        "connecting": "Connecting…",
+        "ok":         "Connected",
+        "lost":       "Connection lost",
+    }
+
+    def _set_conn(self, state: str):
+        style = self._CONN_STYLE.get(state, self._CONN_STYLE["idle"])
+        base_style = (
+            f"{style} border-radius:4px; font-weight:bold;"
+            " font-size:9pt; padding:1px 2px;"
+        )
+        self.axis_lbl.setStyleSheet(base_style)
+        self.axis_lbl.setToolTip(
+            f"{self._label} — {self._CONN_TIP.get(state, '')}"
+            + (f"\nPV: {self._base}" if self._base else "")
+        )
+
+    @pyqtSlot(str, bool)
+    def _on_conn(self, pvname: str, conn: bool):
+        if pvname == f"{self._base}.RBV":
+            self._set_conn("ok" if conn else "lost")
 
     def _send_sp(self):
         pv = self._pvs.get("VAL")
@@ -2215,7 +2258,8 @@ class SampleStation(QMainWindow):
 
         if not EPICS_AVAILABLE:
             if hasattr(self, 'cam_state_lbl'):
-                self.cam_state_lbl.setText("Camera: offline (no EPICS)")
+                self.cam_state_lbl.setText("● Camera: offline")
+                self.cam_state_lbl.setStyleSheet("color: #9ca3af; font-size: 8.5pt;")
             return
 
         try:
@@ -2240,7 +2284,8 @@ class SampleStation(QMainWindow):
         except Exception as e:
             print(f"Camera PV connection failed: {e}")
             if hasattr(self, 'cam_state_lbl'):
-                self.cam_state_lbl.setText("Camera: PV error")
+                self.cam_state_lbl.setText("● Camera: PV error")
+                self.cam_state_lbl.setStyleSheet("color: #dc2626; font-size: 8.5pt;")
 
     def _stop_acquire(self):
         if self._acquire_pv:
@@ -2257,7 +2302,16 @@ class SampleStation(QMainWindow):
 
     @pyqtSlot(str, object)
     def _on_cam_state(self, _pvname: str, value):
-        self.cam_state_lbl.setText(f"Camera: {value}")
+        text = str(value) if value is not None else "—"
+        self.cam_state_lbl.setText(f"● Camera: {text}")
+        low = text.lower()
+        if any(k in low for k in ("acquire", "idle", "wait")):
+            color = "#16a34a"   # green — live
+        elif any(k in low for k in ("error", "abort", "fault", "disconnect")):
+            color = "#dc2626"   # red — problem
+        else:
+            color = "#d97706"   # amber — intermediate state
+        self.cam_state_lbl.setStyleSheet(f"color: {color}; font-size: 8.5pt;")
 
     @pyqtSlot(str, object)
     def _on_image_data(self, _pvname: str, value):
