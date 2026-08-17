@@ -2397,6 +2397,10 @@ class SampleStation(QMainWindow):
         self.z_motor.connect(self.cfg["Z_MOTOR_PV"])
 
     def _apply_camera_config(self):
+        # Stop any pending connection timeout
+        if hasattr(self, '_cam_conn_timer'):
+            self._cam_conn_timer.stop()
+
         for attr in ('_img_pv', '_wid_pv', '_state_pv'):
             old = getattr(self, attr, None)
             if old is not None:
@@ -2407,34 +2411,91 @@ class SampleStation(QMainWindow):
 
         if not EPICS_AVAILABLE:
             if hasattr(self, 'cam_state_lbl'):
-                self.cam_state_lbl.setText("● Camera: offline")
+                self.cam_state_lbl.setText("● Camera: offline (no EPICS)")
                 self.cam_state_lbl.setStyleSheet("color: #9ca3af; font-size: 8.5pt;")
+            return
+
+        cam = self.cfg.get("CAMERA_PREFIX", "").strip()
+        img = self.cfg.get("IMAGE_PREFIX",  "").strip()
+        if not cam or not img:
+            self.cam_state_lbl.setText("● Camera: prefix not configured")
+            self.cam_state_lbl.setStyleSheet("color: #dc2626; font-size: 8.5pt;")
             return
 
         try:
             self._img_bridge   = _PVBridge()
             self._wid_bridge   = _PVBridge()
             self._state_bridge = _PVBridge()
+            self._acq_bridge   = _PVBridge()
+
             self._img_bridge.changed.connect(self._on_image_data)
             self._wid_bridge.changed.connect(self._on_width_data)
             self._state_bridge.changed.connect(self._on_cam_state)
+            self._state_bridge.conn_state.connect(self._on_cam_conn)
+            self._acq_bridge.conn_state.connect(self._on_acquire_conn)
 
-            cam = self.cfg["CAMERA_PREFIX"]
-            img = self.cfg["IMAGE_PREFIX"]
+            self._img_pv   = PV(img + "ArrayData",
+                                callback=self._img_bridge, auto_monitor=True)
+            self._wid_pv   = PV(cam + "ArraySizeX_RBV",
+                                callback=self._wid_bridge, auto_monitor=True)
+            self._state_pv = PV(cam + "DetectorState_RBV",
+                                callback=self._state_bridge,
+                                connection_callback=self._state_bridge.conn_cb,
+                                auto_monitor=True)
 
-            self._img_pv   = PV(img + "ArrayData",         callback=self._img_bridge,   auto_monitor=True)
-            self._wid_pv   = PV(cam + "ArraySizeX_RBV",    callback=self._wid_bridge,   auto_monitor=True)
-            self._state_pv = PV(cam + "DetectorState_RBV", callback=self._state_bridge, auto_monitor=True)
+            # Acquire PV: defer put(1) until the PV actually connects
+            if self._acquire_pv is not None:
+                try:
+                    self._acquire_pv.disconnect()
+                except Exception:
+                    pass
+            self._acquire_pv = PV(cam + "Acquire",
+                                  connection_callback=self._acq_bridge.conn_cb)
+            atexit.register(self._stop_acquire)
 
-            if self._acquire_pv is None:
-                self._acquire_pv = PV(cam + "Acquire")
-                atexit.register(self._stop_acquire)
-            self._acquire_pv.put(1)
+            # Show connecting state immediately
+            self.cam_state_lbl.setText("● Camera: connecting…")
+            self.cam_state_lbl.setStyleSheet("color: #d97706; font-size: 8.5pt;")
+
+            # Timeout: if DetectorState_RBV has not connected in 5 s, warn user
+            self._cam_conn_timer = QTimer(self)
+            self._cam_conn_timer.setSingleShot(True)
+            self._cam_conn_timer.timeout.connect(self._on_cam_conn_timeout)
+            self._cam_conn_timer.start(5000)
+
         except Exception as e:
-            print(f"Camera PV connection failed: {e}")
-            if hasattr(self, 'cam_state_lbl'):
-                self.cam_state_lbl.setText("● Camera: PV error")
-                self.cam_state_lbl.setStyleSheet("color: #dc2626; font-size: 8.5pt;")
+            print(f"Camera PV setup error: {e}")
+            self.cam_state_lbl.setText(f"● Camera: error — {e}")
+            self.cam_state_lbl.setStyleSheet("color: #dc2626; font-size: 8.5pt;")
+
+    @pyqtSlot(str, bool)
+    def _on_cam_conn(self, _pvname: str, conn: bool):
+        """DetectorState_RBV connection callback — fires when EPICS actually connects."""
+        if conn:
+            # Cancel the timeout — we have a live PV
+            if hasattr(self, '_cam_conn_timer'):
+                self._cam_conn_timer.stop()
+        else:
+            self.cam_state_lbl.setText("● Camera: disconnected")
+            self.cam_state_lbl.setStyleSheet("color: #dc2626; font-size: 8.5pt;")
+
+    @pyqtSlot(str, bool)
+    def _on_acquire_conn(self, _pvname: str, conn: bool):
+        """Start acquiring only once the Acquire PV has actually connected."""
+        if conn and self._acquire_pv is not None:
+            self._acquire_pv.put(1)
+
+    def _on_cam_conn_timeout(self):
+        """Fired 5 s after _apply_camera_config if camera PV never responded."""
+        connected = self._state_pv is not None and getattr(self._state_pv, 'connected', False)
+        if not connected:
+            cam = self.cfg.get("CAMERA_PREFIX", "?")
+            self.cam_state_lbl.setText("● Camera: no response")
+            self.cam_state_lbl.setStyleSheet("color: #dc2626; font-size: 8.5pt;")
+            self.cam_state_lbl.setToolTip(
+                f"PV '{cam}DetectorState_RBV' did not connect after 5 s.\n"
+                f"Check CAMERA_PREFIX in Setup."
+            )
 
     def _stop_acquire(self):
         if self._acquire_pv:
