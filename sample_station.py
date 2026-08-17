@@ -35,13 +35,14 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import (
     Qt, pyqtSignal, pyqtSlot, QObject, QEvent,
     QItemSelection, QItemSelectionModel, QRectF,
+    QThread, QTimer,
 )
 from PyQt6.QtGui import QFont, QPainter, QColor, QPen, QBrush, QKeySequence, QShortcut
 
 pg.setConfigOption('imageAxisOrder', 'row-major')
 
 try:
-    from epics import Motor, PV
+    from epics import Motor, PV, dbr
     import epics.ca as _ca
     _ca.initialize_libca()
     EPICS_AVAILABLE = True
@@ -49,6 +50,7 @@ except Exception as _epics_err:
     EPICS_AVAILABLE = False
     Motor = None
     PV = None
+    dbr = None
     print(f"Warning: EPICS unavailable ({_epics_err}) — running in offline mode")
 
 # ── Constants ──────────────────────────────────────────────────────────────────
@@ -592,6 +594,124 @@ class MotorPanel(QObject):
         pv = self._pvs.get("TWF")
         if pv:
             pv.put(1)
+
+
+# ── Off-thread camera image processor ─────────────────────────────────────────
+
+class _ImageProcessor(QObject):
+    """Processes raw camera frames off the Qt main thread."""
+    processed = pyqtSignal(object, object, float, int, int)
+    # emits: rgb_array, gray_array, focus_score, width, height
+
+    @pyqtSlot(object, int)
+    def process(self, raw_value, width):
+        try:
+            raw = np.asarray(raw_value, dtype=np.uint8)
+            if width <= 0 or raw.size == 0:
+                return
+            h = raw.size // (width * 3)
+            if h <= 0 or raw.size != h * width * 3:
+                return
+            bgr = raw.reshape((h, width, 3))
+            if CV2_AVAILABLE:
+                gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+                rgb  = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                fp   = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+            else:
+                gray = bgr.mean(axis=2).astype(np.uint8)
+                rgb  = bgr[:, :, ::-1].copy()
+                fp   = 0.0
+            self.processed.emit(rgb, gray, fp, width, h)
+        except Exception as e:
+            print(f"[_ImageProcessor] {e}")
+
+
+# ── Off-thread Blender SSH worker ──────────────────────────────────────────────
+
+class _BlenderWorker(QObject):
+    """Runs Blender SSH job off the main thread."""
+    finished = pyqtSignal(object)   # list[dict] | None
+    error    = pyqtSignal(str)
+
+    def __init__(self, cfg: dict, positions: list, spacing: float, data_dir: str):
+        super().__init__()
+        self._cfg      = cfg
+        self._positions = positions
+        self._spacing  = spacing
+        self._data_dir = data_dir
+
+    @pyqtSlot()
+    def run(self):
+        try:
+            result = self._do_ssh()
+            self.finished.emit(result)
+        except Exception as e:
+            self.error.emit(str(e))
+
+    def _do_ssh(self):
+        import paramiko as _pm
+        cfg          = self._cfg
+        local_mount  = cfg.get("LOCAL_MOUNT", "")
+        remote_mount = cfg.get("REMOTE_MOUNT", "")
+
+        temp_pos = os.path.join(self._data_dir, "temp_blender_in.pos")
+        with open(temp_pos, 'w') as f:
+            f.write("# x y z\n")
+            for p in normalize_positions(self._positions):
+                f.write(f"{float(p['x']):.6f} {float(p['y']):.6f} {float(p['z']):.6f}\n")
+
+        temp_out = os.path.join(self._data_dir, "temp_blender_out.csv")
+        lifname  = os.path.abspath(temp_pos)
+        lofname  = os.path.abspath(temp_out)
+        ifname   = lifname.replace(local_mount, remote_mount).replace('\\', '/')
+        ofname   = lofname.replace(local_mount, remote_mount).replace('\\', '/')
+
+        blender_exe    = cfg.get("BLENDER_EXE", "blender") or "blender"
+        blender_script = cfg.get("BLENDER_SCRIPT", "")
+        cmd = " ".join([blender_exe, '--background', '--python', blender_script,
+                        '--', ifname, ofname, f"{self._spacing:.2f}"])
+
+        client = _pm.SSHClient()
+        client.set_missing_host_key_policy(_pm.AutoAddPolicy())
+        try:
+            client.connect(cfg.get("BLENDER_HOST",""), port=22,
+                           username=cfg.get("BLENDER_USER",""),
+                           key_filename=cfg.get("BLENDER_KEY",""))
+            _stdin, stdout, stderr = client.exec_command(cmd)
+            out = stdout.read().decode(); err = stderr.read().decode()
+            if out: print(out)
+            if err: print("stderr:", err)
+            if not os.path.exists(lofname):
+                try:
+                    sftp = client.open_sftp()
+                    sftp.get(ofname, lofname)
+                    sftp.close()
+                except Exception:
+                    pass
+        finally:
+            client.close()
+
+        if not os.path.exists(lofname):
+            return None
+
+        parsed_rows = []
+        with open(lofname, newline='', encoding='utf-8', errors='replace') as f:
+            for line in f:
+                stripped = line.strip()
+                if not stripped or stripped.startswith('#'):
+                    continue
+                parts = [x.strip() for x in stripped.split(',')]
+                if len(parts) < 3:
+                    continue
+                try:
+                    parsed_rows.append({
+                        "x": float(parts[0]),
+                        "y": float(parts[1]),
+                        "z": float(parts[2]),
+                    })
+                except ValueError:
+                    continue
+        return parsed_rows if parsed_rows else None
 
 
 # ── Calibration dialog ─────────────────────────────────────────────────────────
@@ -1441,16 +1561,29 @@ class SamplePositionTab(QWidget):
             QMessageBox.warning(self, "Blender", "No station connected.")
             return
         if not PARAMIKO_AVAILABLE:
-            QMessageBox.warning(self, "Blender", "paramiko not installed — SSH disabled.")
+            QMessageBox.critical(self, "SSH Error",
+                                 "paramiko is not installed.\nRun: pip install paramiko")
             return
         try:
             spacing = float(self.interp_edit.text())
         except ValueError:
             QMessageBox.warning(self, "Blender", "Enter a valid number for spacing.")
             return
-        result = self._station._run_blender_ssh(self._positions, spacing)
-        if result is None:
-            return
+
+        data_dir = os.path.join(_DIR, "Data")
+        os.makedirs(data_dir, exist_ok=True)
+        self.blender_btn.setEnabled(False)
+        self.blender_btn.setText("Running…")
+
+        worker = _BlenderWorker(self._station.cfg, self._positions, spacing, data_dir)
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(lambda result: self._station._on_blender_done(result, thread))
+        worker.error.connect(lambda msg: self._station._on_blender_error(msg, thread))
+        thread.start()
+
+    def _apply_blender_result(self, result):
         reply = QMessageBox.question(
             self, "Blender Result",
             f"Blender returned {len(result)} interpolated points.\n"
@@ -1884,6 +2017,8 @@ class SetupDialog(QDialog):
 # ── Main station widget ────────────────────────────────────────────────────────
 
 class SampleStation(QMainWindow):
+    _process_frame = pyqtSignal(object, int)   # raw_value, width → triggers _ImageProcessor
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("ASWAXS Sample Station")
@@ -1914,6 +2049,16 @@ class SampleStation(QMainWindow):
         self.beam_y        = 480
         self._acquire_pv: PV | None = None
         self._center_initialized = False
+        self._last_frame_time  = 0.0
+        self._cam_fps_limit    = 15        # max display frames per second
+
+        # Camera image processing thread
+        self._img_thread    = QThread(self)
+        self._img_processor = _ImageProcessor()
+        self._img_processor.moveToThread(self._img_thread)
+        self._process_frame.connect(self._img_processor.process)
+        self._img_processor.processed.connect(self._on_image_processed)
+        self._img_thread.start()
 
         self._procs: list = []
         atexit.register(self._cleanup_procs)
@@ -2244,6 +2389,15 @@ class SampleStation(QMainWindow):
 
     def _apply_config(self):
         # cfg is already up-to-date (SetupDialog.values() was merged before calling this)
+        self._apply_motor_config()
+        self._apply_camera_config()
+
+    def _apply_motor_config(self):
+        self.x_motor.connect(self.cfg["X_MOTOR_PV"])
+        self.y_motor.connect(self.cfg["Y_MOTOR_PV"])
+        self.z_motor.connect(self.cfg["Z_MOTOR_PV"])
+
+    def _apply_camera_config(self):
         for attr in ('_img_pv', '_wid_pv', '_state_pv'):
             old = getattr(self, attr, None)
             if old is not None:
@@ -2251,10 +2405,6 @@ class SampleStation(QMainWindow):
                     old.disconnect()
                 except Exception:
                     pass
-
-        self.x_motor.connect(self.cfg["X_MOTOR_PV"])
-        self.y_motor.connect(self.cfg["Y_MOTOR_PV"])
-        self.z_motor.connect(self.cfg["Z_MOTOR_PV"])
 
         if not EPICS_AVAILABLE:
             if hasattr(self, 'cam_state_lbl'):
@@ -2273,7 +2423,8 @@ class SampleStation(QMainWindow):
             cam = self.cfg["CAMERA_PREFIX"]
             img = self.cfg["IMAGE_PREFIX"]
 
-            self._img_pv   = PV(img + "ArrayData",         callback=self._img_bridge,   auto_monitor=True)
+            _img_monitor = dbr.DBE_ARRAY if dbr is not None else True
+            self._img_pv   = PV(img + "ArrayData",         callback=self._img_bridge,   auto_monitor=_img_monitor)
             self._wid_pv   = PV(cam + "ArraySizeX_RBV",    callback=self._wid_bridge,   auto_monitor=True)
             self._state_pv = PV(cam + "DetectorState_RBV", callback=self._state_bridge, auto_monitor=True)
 
@@ -2315,39 +2466,30 @@ class SampleStation(QMainWindow):
 
     @pyqtSlot(str, object)
     def _on_image_data(self, _pvname: str, value):
-        try:
-            raw = np.asarray(value, dtype=np.uint8)
-            w   = self.image_width
-            if w <= 0 or raw.size == 0:
-                return
-            h = raw.size // (w * 3)
-            if h <= 0 or raw.size != h * w * 3:
-                return
-            self.image_height = h
-            bgr = raw.reshape((h, w, 3))
-            if CV2_AVAILABLE:
-                gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-                rgb  = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-            else:
-                gray = bgr.mean(axis=2).astype(np.uint8)
-                rgb  = bgr[:, :, ::-1]
-            self.image = gray
-            self.image_item.setImage(rgb, autoLevels=False, levels=(0, 255))
+        now = time.monotonic()
+        if now - self._last_frame_time < 1.0 / self._cam_fps_limit:
+            return
+        self._last_frame_time = now
+        self._process_frame.emit(value, self.image_width)
 
+    @pyqtSlot(object, object, float, int, int)
+    def _on_image_processed(self, rgb, gray, focus_score: float, w: int, h: int):
+        try:
+            self.image        = gray
+            self.image_height = h
+            self.image_item.setImage(rgb, autoLevels=False, levels=(0, 255))
             if not self._center_initialized:
                 self.image_cx = w // 2
                 self.image_cy = h // 2
                 self._center_x_line.setValue(w / 2)
                 self._center_y_line.setValue(h / 2)
                 self._center_initialized = True
-
             if CV2_AVAILABLE:
-                fp = cv2.Laplacian(gray, cv2.CV_64F).var()
-                self.focus_lbl.setText(f"{fp:.3f}")
+                self.focus_lbl.setText(f"{focus_score:.3f}")
             else:
                 self.focus_lbl.setText("(cv2 N/A)")
         except Exception as e:
-            print(f"Image process error: {e}")
+            print(f"[_on_image_processed] {e}")
 
     def _on_global_pv(self, pvname: str, value):
         pass
@@ -2421,10 +2563,15 @@ class SampleStation(QMainWindow):
                 new_y = self.y_motor.get_sp() + self.cf * (y - self.image_height / 2 + 1)
                 self.x_motor.move_to(new_x)
                 self.y_motor.move_to(new_y)
-                while self.x_motor.is_moving() or self.y_motor.is_moving():
-                    QApplication.processEvents()
-            if self.auto_add_cb.isChecked():
-                self.addPosition()
+                if self.auto_add_cb.isChecked():
+                    # Wait for both motors then auto-add — non-blocking via QTimer
+                    def _check_and_add(xm=self.x_motor, ym=self.y_motor,
+                                       t=QTimer(self), add=self.addPosition):
+                        if not xm.is_moving() and not ym.is_moving():
+                            t.stop(); t.deleteLater(); add()
+                    _t = QTimer(self); _t.setInterval(50)
+                    _t.timeout.connect(lambda: _check_and_add(t=_t))
+                    _t.start()
 
         elif self.calibration_flag:
             if self.calib_chosen == 1:
@@ -2567,17 +2714,26 @@ class SampleStation(QMainWindow):
         self._calc_offset()
         if abs(self.x_offset) > 0.005:
             self.x_motor.move_to(self.x_motor.get_sp() - self.x_offset)
-            while self.x_motor.is_moving():
-                QApplication.processEvents()
-        self._calc_offset()
+            self._wait_motor_done(self.x_motor, self._calc_offset)
 
     def _center_y(self):
         self._calc_offset()
         if abs(self.y_offset) > 0.005:
             self.y_motor.move_to(self.y_motor.get_sp() - self.y_offset)
-            while self.y_motor.is_moving():
-                QApplication.processEvents()
-        self._calc_offset()
+            self._wait_motor_done(self.y_motor, self._calc_offset)
+
+    def _wait_motor_done(self, motor, callback=None):
+        """Poll motor MOVN every 50 ms via QTimer — no processEvents blocking."""
+        timer = QTimer(self)
+        timer.setInterval(50)
+        def _check():
+            if not motor.is_moving():
+                timer.stop()
+                timer.deleteLater()
+                if callback:
+                    callback()
+        timer.timeout.connect(_check)
+        timer.start()
 
     # ── Autofocus ──────────────────────────────────────────────────────────
 
@@ -2598,7 +2754,25 @@ class SampleStation(QMainWindow):
         if hasattr(self, 'pos_tab'):
             self.pos_tab._capture_from_stage()
 
-    # ── Blender SSH (returns list of dicts or None) ────────────────────────
+    # ── Blender SSH callbacks (used by _BlenderWorker thread) ─────────────
+
+    def _on_blender_done(self, result, thread):
+        thread.quit(); thread.wait()
+        self.pos_tab.blender_btn.setEnabled(True)
+        self.pos_tab.blender_btn.setText("Run Blender")
+        if result is None:
+            QMessageBox.critical(self, "Blender Error",
+                                 "Output file not found — Blender may have failed.")
+            return
+        self.pos_tab._apply_blender_result(result)
+
+    def _on_blender_error(self, msg: str, thread):
+        thread.quit(); thread.wait()
+        self.pos_tab.blender_btn.setEnabled(True)
+        self.pos_tab.blender_btn.setText("Run Blender")
+        QMessageBox.critical(self, "SSH Error", msg)
+
+    # ── Blender SSH (returns list of dicts or None) — kept for direct/testing use
 
     def _run_blender_ssh(self, positions: list, spacing: float):
         if not PARAMIKO_AVAILABLE:
@@ -2699,6 +2873,11 @@ class SampleStation(QMainWindow):
                 p.terminate()
             except Exception:
                 pass
+
+    def closeEvent(self, event):
+        self._img_thread.quit()
+        self._img_thread.wait(2000)
+        super().closeEvent(event)
 
     # ── Style ──────────────────────────────────────────────────────────────
 
