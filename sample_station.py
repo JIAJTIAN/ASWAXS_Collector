@@ -42,7 +42,7 @@ from PyQt6.QtGui import QFont, QPainter, QColor, QPen, QBrush, QKeySequence, QSh
 pg.setConfigOption('imageAxisOrder', 'row-major')
 
 try:
-    from epics import Motor, PV, dbr
+    from epics import Motor, PV
     import epics.ca as _ca
     _ca.initialize_libca()
     EPICS_AVAILABLE = True
@@ -50,7 +50,6 @@ except Exception as _epics_err:
     EPICS_AVAILABLE = False
     Motor = None
     PV = None
-    dbr = None
     print(f"Warning: EPICS unavailable ({_epics_err}) — running in offline mode")
 
 # ── Constants ──────────────────────────────────────────────────────────────────
@@ -2423,8 +2422,7 @@ class SampleStation(QMainWindow):
             cam = self.cfg["CAMERA_PREFIX"]
             img = self.cfg["IMAGE_PREFIX"]
 
-            _img_monitor = dbr.DBE_ARRAY if dbr is not None else True
-            self._img_pv   = PV(img + "ArrayData",         callback=self._img_bridge,   auto_monitor=_img_monitor)
+            self._img_pv   = PV(img + "ArrayData",         callback=self._img_bridge,   auto_monitor=True)
             self._wid_pv   = PV(cam + "ArraySizeX_RBV",    callback=self._wid_bridge,   auto_monitor=True)
             self._state_pv = PV(cam + "DetectorState_RBV", callback=self._state_bridge, auto_monitor=True)
 
