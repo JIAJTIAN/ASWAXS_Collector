@@ -359,7 +359,8 @@ class _PVBridge(QObject):
     conn_state = pyqtSignal(str, bool)   # pvname, connected
 
     def __call__(self, pvname=None, value=None, **_kw):
-        self.changed.emit(str(pvname or ""), value)
+        if value is not None:
+            self.changed.emit(str(pvname or ""), value)
 
     def conn_cb(self, pvname=None, conn=True, **_kw):
         self.conn_state.emit(str(pvname or ""), bool(conn))
@@ -2443,7 +2444,8 @@ class SampleStation(QMainWindow):
                                 connection_callback=self._state_bridge.conn_cb,
                                 auto_monitor=True)
 
-            # Acquire PV: defer put(1) until the PV actually connects
+            # Acquire PV — call put(1) immediately (pyepics queues it until connected)
+            # Also attach connection_callback as a fallback for reconfigure calls
             if self._acquire_pv is not None:
                 try:
                     self._acquire_pv.disconnect()
@@ -2452,6 +2454,7 @@ class SampleStation(QMainWindow):
             self._acquire_pv = PV(cam + "Acquire",
                                   connection_callback=self._acq_bridge.conn_cb)
             atexit.register(self._stop_acquire)
+            self._acquire_pv.put(1)   # pyepics queues internally if not yet connected
 
             # Show connecting state immediately
             self.cam_state_lbl.setText("● Camera: connecting…")
