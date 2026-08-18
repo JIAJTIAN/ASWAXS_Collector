@@ -2189,6 +2189,7 @@ class SampleStation(QMainWindow):
             dlg.scroll_to(focus_group)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self.cfg.update(dlg.values())
+            self._save_config()
             self._apply_config()
 
     def _open_blender_settings_dialog(self):
