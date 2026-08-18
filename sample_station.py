@@ -603,25 +603,37 @@ class _ImageProcessor(QObject):
     processed = pyqtSignal(object, object, float, int, int)
     # emits: rgb_array, gray_array, focus_score, width, height
 
-    @pyqtSlot(object, int)
-    def process(self, raw_value, width):
+    @pyqtSlot(object, int, int)
+    def process(self, raw_value, width, height):
         try:
             raw = np.asarray(raw_value, dtype=np.uint8)
-            if width <= 0 or raw.size == 0:
+            if width <= 0 or height <= 0 or raw.size == 0:
                 return
-            h = raw.size // (width * 3)
-            if h <= 0 or raw.size != h * width * 3:
-                return
-            bgr = raw.reshape((h, width, 3))
-            if CV2_AVAILABLE:
-                gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-                rgb  = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-                fp   = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+            n_px = width * height
+            if raw.size == n_px:
+                # ── Mono8 ──────────────────────────────────────────────────
+                gray = raw.reshape((height, width))
+                if CV2_AVAILABLE:
+                    rgb = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
+                    fp  = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+                else:
+                    rgb = np.stack([gray, gray, gray], axis=-1)
+                    fp  = 0.0
+            elif raw.size == n_px * 3:
+                # ── RGB8 / BGR8 ────────────────────────────────────────────
+                bgr = raw.reshape((height, width, 3))
+                if CV2_AVAILABLE:
+                    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+                    rgb  = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                    fp   = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+                else:
+                    gray = bgr.mean(axis=2).astype(np.uint8)
+                    rgb  = bgr[:, :, ::-1].copy()
+                    fp   = 0.0
             else:
-                gray = bgr.mean(axis=2).astype(np.uint8)
-                rgb  = bgr[:, :, ::-1].copy()
-                fp   = 0.0
-            self.processed.emit(rgb, gray, fp, width, h)
+                print(f"[_ImageProcessor] unexpected size {raw.size} for {width}×{height}")
+                return
+            self.processed.emit(rgb, gray, fp, width, height)
         except Exception as e:
             print(f"[_ImageProcessor] {e}")
 
@@ -2017,7 +2029,7 @@ class SetupDialog(QDialog):
 # ── Main station widget ────────────────────────────────────────────────────────
 
 class SampleStation(QMainWindow):
-    _process_frame = pyqtSignal(object, int)   # raw_value, width → triggers _ImageProcessor
+    _process_frame = pyqtSignal(object, int, int)   # raw_value, width, height → triggers _ImageProcessor
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -2040,7 +2052,8 @@ class SampleStation(QMainWindow):
         self.pos2          = [1, 1]
         self.image: np.ndarray | None = None
         self.image_width   = 1280
-        self.image_height  = 960
+        self.image_height        = 960
+        self.image_height_sensor = 960   # from ArraySizeY_RBV
         self.image_cx      = 640
         self.image_cy      = 480
         self.cursor_x      = 0
@@ -2402,7 +2415,7 @@ class SampleStation(QMainWindow):
         if hasattr(self, '_cam_conn_timer'):
             self._cam_conn_timer.stop()
 
-        for attr in ('_img_pv', '_wid_pv', '_state_pv'):
+        for attr in ('_img_pv', '_wid_pv', '_hgt_pv', '_state_pv'):
             old = getattr(self, attr, None)
             if old is not None:
                 try:
@@ -2426,11 +2439,13 @@ class SampleStation(QMainWindow):
         try:
             self._img_bridge   = _PVBridge()
             self._wid_bridge   = _PVBridge()
+            self._hgt_bridge   = _PVBridge()
             self._state_bridge = _PVBridge()
             self._acq_bridge   = _PVBridge()
 
             self._img_bridge.changed.connect(self._on_image_data)
             self._wid_bridge.changed.connect(self._on_width_data)
+            self._hgt_bridge.changed.connect(self._on_height_data)
             self._state_bridge.changed.connect(self._on_cam_state)
             self._state_bridge.conn_state.connect(self._on_cam_conn)
             self._acq_bridge.conn_state.connect(self._on_acquire_conn)
@@ -2439,6 +2454,8 @@ class SampleStation(QMainWindow):
                                 callback=self._img_bridge, auto_monitor=True)
             self._wid_pv   = PV(cam + "ArraySizeX_RBV",
                                 callback=self._wid_bridge, auto_monitor=True)
+            self._hgt_pv   = PV(cam + "ArraySizeY_RBV",
+                                callback=self._hgt_bridge, auto_monitor=True)
             self._state_pv = PV(cam + "DetectorState_RBV",
                                 callback=self._state_bridge,
                                 connection_callback=self._state_bridge.conn_cb,
@@ -2514,6 +2531,10 @@ class SampleStation(QMainWindow):
         self.image_width = int(value)
 
     @pyqtSlot(str, object)
+    def _on_height_data(self, _pvname: str, value):
+        self.image_height_sensor = int(value)
+
+    @pyqtSlot(str, object)
     def _on_cam_state(self, _pvname: str, value):
         text = str(value) if value is not None else "—"
         self.cam_state_lbl.setText(f"● Camera: {text}")
@@ -2532,7 +2553,7 @@ class SampleStation(QMainWindow):
         if now - self._last_frame_time < 1.0 / self._cam_fps_limit:
             return
         self._last_frame_time = now
-        self._process_frame.emit(value, self.image_width)
+        self._process_frame.emit(value, self.image_width, self.image_height_sensor)
 
     @pyqtSlot(object, object, float, int, int)
     def _on_image_processed(self, rgb, gray, focus_score: float, w: int, h: int):
